@@ -16,7 +16,7 @@ const RANK_PLURAL = {
 const rankLabel = (r) => RANK_LABEL[r] || String(r);
 const cardText = (c) => `${rankLabel(c.rank)}${c.suit}`;
 
-const SEAT_NAMES = ["You", "Ace", "Deuce", "Trey"];
+const SEAT_NAMES = ["You", "Ace", "Deuce", "Trey", "Four", "Five"];
 const STARTING_STACK = 1000;
 const SMALL_BLIND = 10;
 const BIG_BLIND = 20;
@@ -87,7 +87,10 @@ function best7(cards7) {
   }
   return best;
 }
-function computeEquity(myHole, oppHoles, board, trials = 400) {
+function computeEquity(myHole, oppHoles, board, trials) {
+  // Cost per trial scales with (opponents + 1) hand evaluations. Scale trial count down as the
+  // table gets bigger so a 6-max equity check doesn't take 5x as long as a heads-up one did.
+  if (trials === undefined) trials = Math.max(120, Math.round(800 / (oppHoles.length + 1)));
   if (!oppHoles.length) return 1;
   const known = new Set([...myHole, ...oppHoles.flat(), ...board].map((c) => c.id));
   const deckRemain = [];
@@ -129,15 +132,6 @@ function handName(res) {
     case 2: return `Pair of ${RANK_PLURAL[tb[0]]}`;
     default: return `${RANK_NAME[tb[0]]} high`;
   }
-}
-function preflopStrength(hole) {
-  const [a, b] = hole;
-  const hi = Math.max(a.rank, b.rank), lo = Math.min(a.rank, b.rank);
-  let score = hi + lo;
-  if (a.rank === b.rank) score += 12 + a.rank;
-  if (a.suit === b.suit) score += 4;
-  if (hi - lo <= 2 && a.rank !== b.rank) score += 3;
-  return Math.min(1, score / 55);
 }
 
 // Chen formula: a well-established quick heuristic for starting hand strength.
@@ -299,6 +293,8 @@ export default function App() {
     { name: SEAT_NAMES[1], isHuman: false, stack: STARTING_STACK, hole: [], folded: false, allIn: false, out: false, bet: 0 },
     { name: SEAT_NAMES[2], isHuman: false, stack: STARTING_STACK, hole: [], folded: false, allIn: false, out: false, bet: 0 },
     { name: SEAT_NAMES[3], isHuman: false, stack: STARTING_STACK, hole: [], folded: false, allIn: false, out: false, bet: 0 },
+    { name: SEAT_NAMES[4], isHuman: false, stack: STARTING_STACK, hole: [], folded: false, allIn: false, out: false, bet: 0 },
+    { name: SEAT_NAMES[5], isHuman: false, stack: STARTING_STACK, hole: [], folded: false, allIn: false, out: false, bet: 0 },
   ]);
   const [deck, setDeck] = useState([]);
   const [community, setCommunity] = useState([]);
@@ -607,26 +603,34 @@ export default function App() {
   const applyActionRef = useRef(applyAction);
   applyActionRef.current = applyAction;
 
-  const BOT_TIER = { 1: "easy", 2: "medium", 3: "hard" };
+  const TIER_LABEL = { veryEasy: "Very Easy", easy: "Easy", medium: "Medium", hard: "Hard", veryHard: "Very Hard" };
+  const TIER_CONFIG = {
+    veryEasy: { fn: "passive", preflopCallPct: 15, preflopRaisePct: 92, overfoldMargin: 0.22, raiseThreshold: 0.85, sizing: 1.0 },
+    easy:     { fn: "passive", preflopCallPct: 30, preflopRaisePct: 85, overfoldMargin: 0.15, raiseThreshold: 0.75, sizing: 1.0 },
+    medium:   { fn: "medium" },
+    hard:     { fn: "mdf", mdfMultiplier: 0.6, bluffRaiseFreq: 0.18, valueThreshold: 0.62 },
+    veryHard: { fn: "mdf", mdfMultiplier: 0.85, bluffRaiseFreq: 0.28, valueThreshold: 0.55 },
+  };
+  const BOT_TIER = { 1: "veryEasy", 2: "easy", 3: "medium", 4: "hard", 5: "veryHard" };
 
-  function decideEasy(bot, idx, toCall) {
+  function decidePassive(bot, idx, toCall, cfg) {
     // Documented amateur leaks: loose-passive preflop, overfolds postflop, rarely bluffs, flat sizing.
     if (community.length === 0) {
       const { percentile } = preflopPercentile(bot.hole);
       if (toCall <= 0) return { action: "check" };
-      if (percentile >= 85) return { action: "raise", amount: Math.min(bot.bet + bot.stack, Math.round(currentBet * 2.5)) };
-      if (percentile >= 30) return { action: "call" }; // calls too wide preflop, a classic leak
+      if (percentile >= cfg.preflopRaisePct) return { action: "raise", amount: Math.min(bot.bet + bot.stack, Math.round(currentBet * 2.5)) };
+      if (percentile >= cfg.preflopCallPct) return { action: "call" }; // calls too wide preflop, a classic leak
       return { action: "fold" };
     }
     const equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
     if (toCall <= 0) {
-      if (equity > 0.75) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.round(pot * 1.0)) }; // one-size-fits-all sizing tell
+      if (equity > cfg.raiseThreshold) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.round(pot * cfg.sizing)) }; // one-size-fits-all sizing tell
       return { action: "check" };
     }
     const requiredEquity = toCall / (pot + toCall);
     // Overfolds relative to what's actually required — the "scared of aggression" leak.
-    if (equity < requiredEquity + 0.15) return { action: "fold" };
-    if (equity > 0.75 && bot.stack > toCall) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.round(pot * 1.0)) };
+    if (equity < requiredEquity + cfg.overfoldMargin) return { action: "fold" };
+    if (equity > cfg.raiseThreshold && bot.stack > toCall) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.round(pot * cfg.sizing)) };
     return { action: "call" };
   }
 
@@ -648,15 +652,15 @@ export default function App() {
     return { action: "call" };
   }
 
-  function decideHard(bot, idx, toCall) {
+  function decideMDF(bot, idx, toCall, cfg) {
     // Grounded in Minimum Defense Frequency: continues at least as often as MDF requires,
     // so it can't be profitably exploited by pure bluffs. Balances value raises with bluff-raises.
     let equity;
     if (community.length === 0) equity = preflopPercentile(bot.hole).percentile / 100;
     else equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
     if (toCall <= 0) {
-      const bluffRaise = Math.random() < 0.18; // balanced range: some bluff-raises even when unstrong
-      if (equity > 0.62 || bluffRaise) {
+      const bluffRaise = Math.random() < cfg.bluffRaiseFreq; // balanced range: some bluff-raises even when unstrong
+      if (equity > cfg.valueThreshold || bluffRaise) {
         const sizePct = 0.33 + Math.random() * 0.5; // varied sizing, harder to read
         return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * sizePct))) };
       }
@@ -665,7 +669,7 @@ export default function App() {
     const requiredEquity = toCall / (pot + toCall);
     const mdf = pot / (pot + toCall); // fraction of holdings that should continue, in theory
     if (equity >= requiredEquity) {
-      const valueRaise = equity > 0.68 && bot.stack > toCall;
+      const valueRaise = equity > cfg.valueThreshold + 0.06 && bot.stack > toCall;
       if (valueRaise) {
         const sizePct = 0.4 + Math.random() * 0.5;
         return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * sizePct))) };
@@ -675,7 +679,7 @@ export default function App() {
     // Below breakeven equity, but within bluff-catch range: continue at roughly the MDF-implied rate
     // rather than folding outright, so a human can't profitably bluff this bot into submission.
     const bluffCatchZone = equity > requiredEquity - 0.18;
-    if (bluffCatchZone && Math.random() < mdf * 0.6) return { action: "call" };
+    if (bluffCatchZone && Math.random() < mdf * cfg.mdfMultiplier) return { action: "call" };
     return { action: "fold" };
   }
 
@@ -685,9 +689,10 @@ export default function App() {
 
   function botDecide(bot, idx) {
     const toCall = currentBet - bot.bet;
-    const tier = BOT_TIER[idx] || "medium";
-    if (tier === "easy") return decideEasy(bot, idx, toCall);
-    if (tier === "hard") return decideHard(bot, idx, toCall);
+    const tierName = BOT_TIER[idx] || "medium";
+    const cfg = TIER_CONFIG[tierName];
+    if (cfg.fn === "passive") return decidePassive(bot, idx, toCall, cfg);
+    if (cfg.fn === "mdf") return decideMDF(bot, idx, toCall, cfg);
     return decideMedium(bot, idx, toCall);
   }
 
@@ -782,12 +787,14 @@ export default function App() {
     return simulateBeatingHands(human.hole, community);
   }, [human?.hole, community]);
 
-  const seatOrder = [0, 1, 2, 3];
+  const seatOrder = [0, 1, 2, 3, 4, 5];
   const seatStyle = [
     { left: "50%", bottom: "2%", transform: "translateX(-50%)" },
-    { left: "4%", top: "38%", transform: "translateY(-50%)" },
-    { left: "50%", top: "3%", transform: "translateX(-50%)" },
-    { right: "4%", top: "38%", transform: "translateY(-50%)" },
+    { left: "2%", bottom: "22%", transform: "translateY(50%)" },
+    { left: "8%", top: "4%", transform: "translateX(-50%)" },
+    { left: "50%", top: "-2%", transform: "translateX(-50%)" },
+    { right: "8%", top: "4%", transform: "translateX(50%)" },
+    { right: "2%", bottom: "22%", transform: "translateY(50%)" },
   ];
 
   return (
@@ -822,7 +829,7 @@ export default function App() {
         </div>
 
         <div style={{
-          position: "relative", width: "100%", aspectRatio: "16/10", background: "var(--felt-felt-rail)",
+          position: "relative", width: "100%", aspectRatio: "16/13", background: "var(--felt-felt-rail)",
           borderRadius: "50% / 40%", padding: 18, boxSizing: "border-box",
         }}>
           <div style={{
@@ -860,7 +867,7 @@ export default function App() {
                       ))}
                     </div>
                     <div style={{ fontSize: 13, fontWeight: 500, color: p.out ? "var(--felt-brass)" : "var(--felt-cream)" }}>
-                      {p.name}{BOT_TIER[i] ? ` (${BOT_TIER[i][0].toUpperCase()}${BOT_TIER[i].slice(1)})` : ""}{isDealer ? " (D)" : ""}{p.out ? " — out" : p.folded ? " — folded" : ""}
+                      {p.name}{BOT_TIER[i] ? ` (${TIER_LABEL[BOT_TIER[i]]})` : ""}{isDealer ? " (D)" : ""}{p.out ? " — out" : p.folded ? " — folded" : ""}
                     </div>
                     <div style={{ fontFamily: "var(--felt-mono)", fontSize: 12, color: "var(--felt-brass)" }}>{p.stack}</div>
                     {p.bet > 0 && <div style={{ marginTop: 4 }}><Chip amount={p.bet} /></div>}
