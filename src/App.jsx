@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 const SUITS = ["s", "h", "d", "c"];
 const SUIT_SYMBOL = { s: "♠", h: "♥", d: "♦", c: "♣" };
@@ -200,8 +200,40 @@ const HAND_LADDER = [
   { cat: 4, name: "Three of a kind" }, { cat: 5, name: "Straight" }, { cat: 6, name: "Flush" },
   { cat: 7, name: "Full house" }, { cat: 8, name: "Four of a kind" }, { cat: 9, name: "Straight flush" },
 ];
-function whatBeats(category) {
-  return HAND_LADDER.filter((h) => h.cat > category);
+
+// Instead of a static "anything ranked higher beats you" ladder, simulate what's actually
+// possible given the real remaining deck: deal a random plausible opponent hand plus whatever
+// board cards are still to come, thousands of times, and report what genuinely showed up.
+function simulateBeatingHands(myHole, board, trials = 500) {
+  const known = new Set([...myHole, ...board].map((c) => c.id));
+  const deckRemain = [];
+  for (const s of SUITS) for (const r of RANKS) { const id = `${r}${s}`; if (!known.has(id)) deckRemain.push({ rank: r, suit: s, id }); }
+  const need = 5 - board.length;
+  const tally = {};
+  let beatCount = 0;
+  for (let t = 0; t < trials; t++) {
+    const pool = [...deckRemain];
+    const drawOpp = [];
+    for (let k = 0; k < 2; k++) { const idx = Math.floor(Math.random() * pool.length); drawOpp.push(pool[idx]); pool.splice(idx, 1); }
+    const drawBoard = [];
+    for (let k = 0; k < need; k++) { const idx = Math.floor(Math.random() * pool.length); drawBoard.push(pool[idx]); pool.splice(idx, 1); }
+    const finalBoard = [...board, ...drawBoard];
+    const myRes = bestHand([...myHole, ...finalBoard]);
+    const oppRes = bestHand([...drawOpp, ...finalBoard]);
+    if (compareScore(oppRes.score, myRes.score) > 0) {
+      beatCount++;
+      tally[oppRes.category] = (tally[oppRes.category] || 0) + 1;
+    }
+  }
+  const categories = Object.entries(tally)
+    .map(([cat, count]) => ({
+      cat: Number(cat),
+      name: HAND_LADDER.find((h) => h.cat === Number(cat))?.name || "?",
+      pct: Math.round((count / trials) * 100),
+    }))
+    .filter((c) => c.pct > 0)
+    .sort((a, b) => b.cat - a.cat);
+  return { beatPct: Math.round((beatCount / trials) * 100), categories };
 }
 
 function nextActiveIndex(players, from) {
@@ -575,31 +607,88 @@ export default function App() {
   const applyActionRef = useRef(applyAction);
   applyActionRef.current = applyAction;
 
-  function botDecide(bot, idx) {
-    const toCall = currentBet - bot.bet;
-    let strength;
-    if (community.length === 0) strength = preflopStrength(bot.hole);
-    else strength = best7([...bot.hole, ...community]).category / 9;
-    const bluff = Math.random() < 0.07;
-    const noise = Math.random() * 0.18 - 0.09;
-    const aggression = Math.min(1, strength + (bluff ? 0.35 : 0) + noise);
+  const BOT_TIER = { 1: "easy", 2: "medium", 3: "hard" };
 
+  function decideEasy(bot, idx, toCall) {
+    // Documented amateur leaks: loose-passive preflop, overfolds postflop, rarely bluffs, flat sizing.
+    if (community.length === 0) {
+      const { percentile } = preflopPercentile(bot.hole);
+      if (toCall <= 0) return { action: "check" };
+      if (percentile >= 85) return { action: "raise", amount: Math.min(bot.bet + bot.stack, Math.round(currentBet * 2.5)) };
+      if (percentile >= 30) return { action: "call" }; // calls too wide preflop, a classic leak
+      return { action: "fold" };
+    }
+    const equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
     if (toCall <= 0) {
-      if (aggression > 0.58 && bot.stack > 0) {
-        const raiseAmt = Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * 0.55)));
-        return { action: "raise", amount: raiseAmt };
+      if (equity > 0.75) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.round(pot * 1.0)) }; // one-size-fits-all sizing tell
+      return { action: "check" };
+    }
+    const requiredEquity = toCall / (pot + toCall);
+    // Overfolds relative to what's actually required — the "scared of aggression" leak.
+    if (equity < requiredEquity + 0.15) return { action: "fold" };
+    if (equity > 0.75 && bot.stack > toCall) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.round(pot * 1.0)) };
+    return { action: "call" };
+  }
+
+  function decideMedium(bot, idx, toCall) {
+    // Sound, standard, unexploitative — but not sophisticated. Real equity, conventional sizing.
+    let equity;
+    if (community.length === 0) equity = preflopPercentile(bot.hole).percentile / 100;
+    else equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
+    const bluff = Math.random() < 0.07;
+    const noise = Math.random() * 0.1 - 0.05;
+    const strength = Math.min(1, equity + (bluff ? 0.3 : 0) + noise);
+    if (toCall <= 0) {
+      if (strength > 0.6) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * 0.6))) };
+      return { action: "check" };
+    }
+    const requiredEquity = toCall / (pot + toCall);
+    if (strength < requiredEquity && strength < 0.4) return { action: "fold" };
+    if (strength > 0.65 && bot.stack > toCall) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * 0.65))) };
+    return { action: "call" };
+  }
+
+  function decideHard(bot, idx, toCall) {
+    // Grounded in Minimum Defense Frequency: continues at least as often as MDF requires,
+    // so it can't be profitably exploited by pure bluffs. Balances value raises with bluff-raises.
+    let equity;
+    if (community.length === 0) equity = preflopPercentile(bot.hole).percentile / 100;
+    else equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
+    if (toCall <= 0) {
+      const bluffRaise = Math.random() < 0.18; // balanced range: some bluff-raises even when unstrong
+      if (equity > 0.62 || bluffRaise) {
+        const sizePct = 0.33 + Math.random() * 0.5; // varied sizing, harder to read
+        return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * sizePct))) };
       }
       return { action: "check" };
     }
-    const potOdds = toCall / (pot + toCall);
-    if (aggression < 0.16 || (aggression < potOdds * 1.3 && aggression < 0.5)) {
-      if (aggression < 0.42) return { action: "fold" };
+    const requiredEquity = toCall / (pot + toCall);
+    const mdf = pot / (pot + toCall); // fraction of holdings that should continue, in theory
+    if (equity >= requiredEquity) {
+      const valueRaise = equity > 0.68 && bot.stack > toCall;
+      if (valueRaise) {
+        const sizePct = 0.4 + Math.random() * 0.5;
+        return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * sizePct))) };
+      }
+      return { action: "call" };
     }
-    if (aggression > 0.68 && bot.stack > toCall) {
-      const raiseAmt = Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * 0.6)));
-      return { action: "raise", amount: raiseAmt };
-    }
-    return { action: "call" };
+    // Below breakeven equity, but within bluff-catch range: continue at roughly the MDF-implied rate
+    // rather than folding outright, so a human can't profitably bluff this bot into submission.
+    const bluffCatchZone = equity > requiredEquity - 0.18;
+    if (bluffCatchZone && Math.random() < mdf * 0.6) return { action: "call" };
+    return { action: "fold" };
+  }
+
+  function opponentHolesFor(idx) {
+    return players.filter((pl, i) => i !== idx && !pl.out && !pl.folded).map((pl) => pl.hole);
+  }
+
+  function botDecide(bot, idx) {
+    const toCall = currentBet - bot.bet;
+    const tier = BOT_TIER[idx] || "medium";
+    if (tier === "easy") return decideEasy(bot, idx, toCall);
+    if (tier === "hard") return decideHard(bot, idx, toCall);
+    return decideMedium(bot, idx, toCall);
   }
 
   useEffect(() => {
@@ -688,11 +777,10 @@ export default function App() {
     }
     return handName(bestHand([...human.hole, ...community]));
   })();
-  const humanBestCategory = (() => {
+  const beatingHandsInfo = useMemo(() => {
     if (!human || human.hole.length < 2 || community.length === 0) return null;
-    return bestHand([...human.hole, ...community]).category;
-  })();
-  const beatingHands = humanBestCategory !== null ? whatBeats(humanBestCategory) : [];
+    return simulateBeatingHands(human.hole, community);
+  }, [human?.hole, community]);
 
   const seatOrder = [0, 1, 2, 3];
   const seatStyle = [
@@ -772,7 +860,7 @@ export default function App() {
                       ))}
                     </div>
                     <div style={{ fontSize: 13, fontWeight: 500, color: p.out ? "var(--felt-brass)" : "var(--felt-cream)" }}>
-                      {p.name}{isDealer ? " (D)" : ""}{p.out ? " — out" : p.folded ? " — folded" : ""}
+                      {p.name}{BOT_TIER[i] ? ` (${BOT_TIER[i][0].toUpperCase()}${BOT_TIER[i].slice(1)})` : ""}{isDealer ? " (D)" : ""}{p.out ? " — out" : p.folded ? " — folded" : ""}
                     </div>
                     <div style={{ fontFamily: "var(--felt-mono)", fontSize: 12, color: "var(--felt-brass)" }}>{p.stack}</div>
                     {p.bet > 0 && <div style={{ marginTop: 4 }}><Chip amount={p.bet} /></div>}
@@ -789,23 +877,23 @@ export default function App() {
           </div>
         )}
 
-        {showHint && beatingHands.length > 0 && phase !== "idle" && phase !== "handover" && (
+        {showHint && beatingHandsInfo && beatingHandsInfo.categories.length > 0 && phase !== "idle" && phase !== "handover" && (
           <div style={{
             marginTop: 6, fontSize: 12, fontFamily: "var(--felt-mono)", color: "rgba(243,239,228,0.65)",
             display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center",
           }}>
-            <span>Beats you:</span>
-            {beatingHands.map((h) => (
+            <span>Could beat you ({beatingHandsInfo.beatPct}% of possible outcomes):</span>
+            {beatingHandsInfo.categories.map((h) => (
               <span key={h.cat} style={{
                 background: "rgba(0,0,0,0.25)", border: "1px solid var(--felt-felt-2)", borderRadius: 999,
                 padding: "2px 8px",
-              }}>{h.name}</span>
+              }}>{h.name} ({h.pct}%)</span>
             ))}
           </div>
         )}
-        {showHint && humanBestCategory === 9 && phase !== "idle" && phase !== "handover" && (
+        {showHint && beatingHandsInfo && beatingHandsInfo.categories.length === 0 && phase !== "idle" && phase !== "handover" && (
           <div style={{ marginTop: 6, fontSize: 12, fontFamily: "var(--felt-mono)", color: "rgba(243,239,228,0.65)" }}>
-            Nothing beats a straight flush.
+            Nothing beat you in {500} simulated outcomes given the cards left in the deck.
           </div>
         )}
 
