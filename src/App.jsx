@@ -328,7 +328,7 @@ export default function App() {
   const activePlayers = (ps) => ps.filter((p) => !p.out && !p.folded);
 
   function resetForNewHand(ps) {
-    return ps.map((p) => ({ ...p, hole: [], folded: p.out, allIn: false, bet: 0 }));
+    return ps.map((p) => ({ ...p, hole: [], folded: p.out, allIn: false, bet: 0, totalInvested: 0 }));
   }
 
   function startHand() {
@@ -357,9 +357,9 @@ export default function App() {
     handMetaRef.current.holeCards = ps[0].out ? [] : [...ps[0].hole];
 
     const sbAmt = Math.min(SMALL_BLIND, ps[sb].stack);
-    ps[sb].stack -= sbAmt; ps[sb].bet = sbAmt; if (ps[sb].stack === 0) ps[sb].allIn = true;
+    ps[sb].stack -= sbAmt; ps[sb].bet = sbAmt; ps[sb].totalInvested = sbAmt; if (ps[sb].stack === 0) ps[sb].allIn = true;
     const bbAmt = Math.min(BIG_BLIND, ps[bb].stack);
-    ps[bb].stack -= bbAmt; ps[bb].bet = bbAmt; if (ps[bb].stack === 0) ps[bb].allIn = true;
+    ps[bb].stack -= bbAmt; ps[bb].bet = bbAmt; ps[bb].totalInvested = bbAmt; if (ps[bb].stack === 0) ps[bb].allIn = true;
 
     const potNow = sbAmt + bbAmt;
     const active = ps.filter((p) => !p.out).map((_, i) => i).filter((i) => !ps[i].out);
@@ -379,17 +379,53 @@ export default function App() {
     pushLog(`New hand. ${ps[d].name} deals. ${ps[sb].name} posts ${sbAmt}, ${ps[bb].name} posts ${bbAmt}.`);
   }
 
-  function awardPot(ps, potAmt, winners, communityCards, reason) {
-    const share = Math.floor(potAmt / winners.length);
-    const remainder = potAmt - share * winners.length;
-    winners.forEach((idx, i) => {
-      ps[idx].stack += share + (i === 0 ? remainder : 0);
-    });
-    if (winners.length === 1) {
-      pushLog(`${ps[winners[0]].name} wins ${potAmt} chips. ${reason}`);
-    } else {
-      pushLog(`Split pot: ${winners.map((i) => ps[i].name).join(" and ")} share ${potAmt} chips. ${reason}`);
+  // Standard side-pot algorithm: split the pot into layers by distinct contribution levels.
+  // Each layer is only won by players who contributed at least that layer's threshold —
+  // this is what stops a short stack's all-in from winning chips it was never matched against.
+  function computeSidePots(ps) {
+    const contributors = ps.map((p, i) => ({ i, amount: p.totalInvested || 0 })).filter((c) => c.amount > 0);
+    const levels = [...new Set(contributors.map((c) => c.amount))].sort((a, b) => a - b);
+    const pots = [];
+    let prev = 0;
+    for (const level of levels) {
+      const layerContributors = contributors.filter((c) => c.amount >= level);
+      const layerAmount = (level - prev) * layerContributors.length;
+      const eligible = layerContributors.map((c) => c.i).filter((i) => !ps[i].folded);
+      if (layerAmount > 0 && eligible.length > 0) pots.push({ amount: layerAmount, eligible });
+      prev = level;
     }
+    return pots;
+  }
+
+  // Awards each pot layer to the best hand among that layer's eligible players. resultsByIdx is
+  // null for a fold-out (no showdown needed, single winner per layer since only one player remains).
+  function awardSidePots(ps, pots, resultsByIdx) {
+    const summaries = [];
+    for (const layer of pots) {
+      let winners;
+      if (layer.eligible.length === 1 || !resultsByIdx) {
+        winners = layer.eligible.length === 1 ? layer.eligible : [layer.eligible[0]];
+      } else {
+        let best = resultsByIdx[layer.eligible[0]].score;
+        for (const i of layer.eligible) if (compareScore(resultsByIdx[i].score, best) > 0) best = resultsByIdx[i].score;
+        winners = layer.eligible.filter((i) => compareScore(resultsByIdx[i].score, best) === 0);
+      }
+      const share = Math.floor(layer.amount / winners.length);
+      const remainder = layer.amount - share * winners.length;
+      winners.forEach((idx, i) => { ps[idx].stack += share + (i === 0 ? remainder : 0); });
+      summaries.push({ amount: layer.amount, winners });
+    }
+    return summaries;
+  }
+
+  function logPotSummaries(ps, summaries, resultsByIdx) {
+    summaries.forEach((s, idx) => {
+      const label = summaries.length > 1 ? (idx === 0 ? "Main pot" : `Side pot ${idx}`) : "Pot";
+      const names = s.winners.map((i) => ps[i].name);
+      const handDesc = resultsByIdx && resultsByIdx[s.winners[0]] ? ` (${handName(resultsByIdx[s.winners[0]])})` : "";
+      if (s.winners.length === 1) pushLog(`${label}: ${names[0]} wins ${s.amount} chips.${handDesc}`);
+      else pushLog(`${label} split: ${names.join(" and ")} share ${s.amount} chips.${handDesc}`);
+    });
   }
 
   function recordHand(ps, wentToShowdown, showdownHandName, board) {
@@ -435,8 +471,9 @@ export default function App() {
   }
 
   function endHandSinglePlayer(ps, potAmt, board) {
-    const winnerIdx = ps.findIndex((p) => !p.out && !p.folded);
-    awardPot(ps, potAmt, [winnerIdx], [], "Everyone else folded.");
+    const pots = computeSidePots(ps);
+    const summaries = awardSidePots(ps, pots, null);
+    logPotSummaries(ps, summaries, null);
     recordHand(ps, false, null, board);
     setPlayers(ps);
     setPot(0);
@@ -448,13 +485,13 @@ export default function App() {
   function runShowdown(ps, potAmt, communityCards) {
     const contenders = ps.map((p, i) => ({ i, p })).filter(({ p }) => !p.out && !p.folded);
     const results = contenders.map(({ i, p }) => ({ i, res: best7([...p.hole, ...communityCards]) }));
-    let bestScore = results[0].res.score;
-    results.forEach((r) => { if (compareScore(r.res.score, bestScore) > 0) bestScore = r.res.score; });
-    const winners = results.filter((r) => compareScore(r.res.score, bestScore) === 0).map((r) => r.i);
-    const winRes = results.find((r) => r.i === winners[0]).res;
-    awardPot(ps, potAmt, winners, communityCards, handName(winRes));
-    const humanResult = results.find((r) => r.i === 0);
-    recordHand(ps, humanResult !== undefined, humanResult ? handName(humanResult.res) : null, communityCards);
+    const resultsByIdx = {};
+    results.forEach((r) => { resultsByIdx[r.i] = r.res; });
+    const pots = computeSidePots(ps);
+    const summaries = awardSidePots(ps, pots, resultsByIdx);
+    logPotSummaries(ps, summaries, resultsByIdx);
+    const humanResult = resultsByIdx[0];
+    recordHand(ps, humanResult !== undefined, humanResult ? handName(humanResult) : null, communityCards);
     setShowdown(results.map((r) => ({ i: r.i, name: handName(r.res) })));
     setPlayers(ps);
     setPot(0);
@@ -566,7 +603,7 @@ export default function App() {
       pushLog(`${p.name} checks.`);
     } else if (action === "call") {
       const toCall = Math.min(currentBet - p.bet, p.stack);
-      p.stack -= toCall; p.bet += toCall; newPot += toCall;
+      p.stack -= toCall; p.bet += toCall; p.totalInvested = (p.totalInvested || 0) + toCall; newPot += toCall;
       if (p.stack === 0) p.allIn = true;
       need.delete(idx);
       pushLog(toCall > 0 ? `${p.name} calls ${toCall}.` : `${p.name} checks.`);
@@ -574,7 +611,7 @@ export default function App() {
       const target = Math.min(amount, p.bet + p.stack);
       const contribution = target - p.bet;
       const raiseSize = target - currentBet;
-      p.stack -= contribution; p.bet = target; newPot += contribution;
+      p.stack -= contribution; p.bet = target; p.totalInvested = (p.totalInvested || 0) + contribution; newPot += contribution;
       if (p.stack === 0) p.allIn = true;
       newCurrentBet = target;
       newMinRaise = Math.max(raiseSize, BIG_BLIND);
@@ -624,13 +661,13 @@ export default function App() {
     }
     const equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
     if (toCall <= 0) {
-      if (equity > cfg.raiseThreshold) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.round(pot * cfg.sizing)) }; // one-size-fits-all sizing tell
+      if (equity > cfg.raiseThreshold) return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, pot, cfg.sizing) }; // one-size-fits-all sizing tell
       return { action: "check" };
     }
     const requiredEquity = toCall / (pot + toCall);
     // Overfolds relative to what's actually required — the "scared of aggression" leak.
     if (equity < requiredEquity + cfg.overfoldMargin) return { action: "fold" };
-    if (equity > cfg.raiseThreshold && bot.stack > toCall) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.round(pot * cfg.sizing)) };
+    if (equity > cfg.raiseThreshold && bot.stack > toCall) return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, pot, cfg.sizing) };
     return { action: "call" };
   }
 
@@ -642,13 +679,14 @@ export default function App() {
     const bluff = Math.random() < 0.07;
     const noise = Math.random() * 0.1 - 0.05;
     const strength = Math.min(1, equity + (bluff ? 0.3 : 0) + noise);
+    const potForSizing = pot || BIG_BLIND;
     if (toCall <= 0) {
-      if (strength > 0.6) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * 0.6))) };
+      if (strength > 0.6) return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, potForSizing, 0.6) };
       return { action: "check" };
     }
     const requiredEquity = toCall / (pot + toCall);
     if (strength < requiredEquity && strength < 0.4) return { action: "fold" };
-    if (strength > 0.65 && bot.stack > toCall) return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * 0.65))) };
+    if (strength > 0.65 && bot.stack > toCall) return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, potForSizing, 0.65) };
     return { action: "call" };
   }
 
@@ -658,11 +696,12 @@ export default function App() {
     let equity;
     if (community.length === 0) equity = preflopPercentile(bot.hole).percentile / 100;
     else equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
+    const potForSizing = pot || BIG_BLIND;
     if (toCall <= 0) {
       const bluffRaise = Math.random() < cfg.bluffRaiseFreq; // balanced range: some bluff-raises even when unstrong
       if (equity > cfg.valueThreshold || bluffRaise) {
         const sizePct = 0.33 + Math.random() * 0.5; // varied sizing, harder to read
-        return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * sizePct))) };
+        return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, potForSizing, sizePct) };
       }
       return { action: "check" };
     }
@@ -672,7 +711,7 @@ export default function App() {
       const valueRaise = equity > cfg.valueThreshold + 0.06 && bot.stack > toCall;
       if (valueRaise) {
         const sizePct = 0.4 + Math.random() * 0.5;
-        return { action: "raise", amount: Math.min(bot.bet + bot.stack, currentBet + Math.max(minRaise, Math.round((pot || BIG_BLIND) * sizePct))) };
+        return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, potForSizing, sizePct) };
       }
       return { action: "call" };
     }
@@ -681,6 +720,18 @@ export default function App() {
     const bluffCatchZone = equity > requiredEquity - 0.18;
     if (bluffCatchZone && Math.random() < mdf * cfg.mdfMultiplier) return { action: "call" };
     return { action: "fold" };
+  }
+
+  // Stack-to-pot ratio (SPR) aware sizing: a pot-relative raise that ignores remaining stack
+  // will naturally snowball into an accidental all-in as the pot grows street over street.
+  // When the stack is already short relative to the pot, the sound move is to shove or back off,
+  // not to keep making medium raises that drift to full commitment without ever deciding to.
+  function sizedRaiseAmount(bot, currentBetNow, potNow, sizePct) {
+    const spr = bot.stack / Math.max(potNow, 1);
+    if (spr < 1) return bot.bet + bot.stack; // short enough that a partial raise doesn't make sense — shove
+    const raw = currentBetNow + Math.max(minRaise, Math.round(potNow * sizePct));
+    const cap = bot.bet + Math.round(bot.stack * 0.75); // never commit more than 75% of remaining stack in one raise
+    return Math.min(bot.bet + bot.stack, raw, Math.max(cap, currentBetNow + minRaise));
   }
 
   function opponentHolesFor(idx) {
