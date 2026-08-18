@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
 const SUITS = ["s", "h", "d", "c"];
-const SUIT_SYMBOL = { s: "\u2660", h: "\u2665", d: "\u2666", c: "\u2663" };
+const SUIT_SYMBOL = { s: "♠", h: "♥", d: "♦", c: "♣" };
 const SUIT_RED = { s: false, h: true, d: true, c: false };
 const RANKS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 const RANK_LABEL = { 11: "J", 12: "Q", 13: "K", 14: "A" };
@@ -14,6 +14,7 @@ const RANK_PLURAL = {
   8: "Eights", 9: "Nines", 10: "Tens", 11: "Jacks", 12: "Queens", 13: "Kings", 14: "Aces",
 };
 const rankLabel = (r) => RANK_LABEL[r] || String(r);
+const cardText = (c) => `${rankLabel(c.rank)}${c.suit}`;
 
 const SEAT_NAMES = ["You", "Ace", "Deuce", "Trey"];
 const STARTING_STACK = 1000;
@@ -188,8 +189,14 @@ export default function PokerPractice() {
   const [raiseTo, setRaiseTo] = useState(BIG_BLIND * 2);
   const [showdown, setShowdown] = useState(null);
   const [gameOver, setGameOver] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [showStats, setShowStats] = useState(false);
   const logEndRef = useRef(null);
   const actionLock = useRef(false);
+  const handActionsRef = useRef({ preflop: [], flop: [], turn: [], river: [] });
+  const handStartStackRef = useRef(STARTING_STACK);
+  const handNumRef = useRef(0);
+  const handMetaRef = useRef({ holeCards: [], recorded: false });
 
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [log]);
 
@@ -211,6 +218,10 @@ export default function PokerPractice() {
       return;
     }
     ps = resetForNewHand(ps);
+    handActionsRef.current = { preflop: [], flop: [], turn: [], river: [] };
+    handStartStackRef.current = ps[0].stack;
+    handNumRef.current += 1;
+    handMetaRef.current = { holeCards: [], recorded: false };
     let d = dealer < 0 ? 0 : nextActiveIndex(ps, dealer);
     const sb = nextActiveIndex(ps, d);
     const bb = nextActiveIndex(ps, sb);
@@ -218,6 +229,7 @@ export default function PokerPractice() {
 
     let newDeck = shuffle(makeDeck());
     for (const p of ps) if (!p.out) { p.hole = [newDeck.pop(), newDeck.pop()]; }
+    handMetaRef.current.holeCards = ps[0].out ? [] : [...ps[0].hole];
 
     const sbAmt = Math.min(SMALL_BLIND, ps[sb].stack);
     ps[sb].stack -= sbAmt; ps[sb].bet = sbAmt; if (ps[sb].stack === 0) ps[sb].allIn = true;
@@ -255,9 +267,33 @@ export default function PokerPractice() {
     }
   }
 
-  function endHandSinglePlayer(ps, potAmt) {
+  function recordHand(ps, wentToShowdown, showdownHandName, board) {
+    if (handMetaRef.current.recorded) return;
+    handMetaRef.current.recorded = true;
+    const acts = handActionsRef.current;
+    const vpip = acts.preflop.some((a) => a === "call" || a.startsWith("raise"));
+    setHistory((h) => [
+      ...h,
+      {
+        hand: handNumRef.current,
+        holeCards: handMetaRef.current.holeCards.map(cardText),
+        board: (board || []).map(cardText),
+        preflop: [...acts.preflop],
+        flop: [...acts.flop],
+        turn: [...acts.turn],
+        river: [...acts.river],
+        vpip,
+        wentToShowdown,
+        showdownHand: showdownHandName || null,
+        net: ps[0].stack - handStartStackRef.current,
+      },
+    ]);
+  }
+
+  function endHandSinglePlayer(ps, potAmt, board) {
     const winnerIdx = ps.findIndex((p) => !p.out && !p.folded);
     awardPot(ps, potAmt, [winnerIdx], [], "Everyone else folded.");
+    recordHand(ps, false, null, board);
     setPlayers(ps);
     setPot(0);
     setPhase("handover");
@@ -273,6 +309,8 @@ export default function PokerPractice() {
     const winners = results.filter((r) => compareScore(r.res.score, bestScore) === 0).map((r) => r.i);
     const winRes = results.find((r) => r.i === winners[0]).res;
     awardPot(ps, potAmt, winners, communityCards, handName(winRes));
+    const humanResult = results.find((r) => r.i === 0);
+    recordHand(ps, true, humanResult ? handName(humanResult.res) : null, communityCards);
     setShowdown(results.map((r) => ({ i: r.i, name: handName(r.res) })));
     setPlayers(ps);
     setPot(0);
@@ -290,7 +328,7 @@ export default function PokerPractice() {
 
     const dealNext = (n) => { for (let k = 0; k < n; k++) comm.push(nd.pop()); };
 
-    if (remaining <= 1) { setDeck(nd); setCommunity(comm); endHandSinglePlayer(ps, potArg); return; }
+    if (remaining <= 1) { setDeck(nd); setCommunity(comm); endHandSinglePlayer(ps, potArg, comm); return; }
 
     if (phase === "preflop") { dealNext(3); setPhase("flop"); pushLog(`Flop: ${comm.map((c) => rankLabel(c.rank) + SUIT_SYMBOL[c.suit]).join(" ")}`); }
     else if (phase === "flop") { dealNext(1); setPhase("turn"); pushLog(`Turn: ${rankLabel(comm[3].rank)}${SUIT_SYMBOL[comm[3].suit]}`); }
@@ -324,6 +362,13 @@ export default function PokerPractice() {
     const p = ps[idx];
     let newPot = pot, newCurrentBet = currentBet, newMinRaise = minRaise;
     const need = new Set(needsToAct);
+
+    if (idx === 0 && handActionsRef.current[phase]) {
+      let desc = action;
+      if (action === "call") desc = `call ${Math.min(currentBet - p.bet, p.stack)}`;
+      else if (action === "raise") desc = `raise to ${Math.min(amount, p.bet + p.stack)}`;
+      handActionsRef.current[phase].push(desc);
+    }
 
     if (action === "fold") {
       p.folded = true;
@@ -409,6 +454,54 @@ export default function PokerPractice() {
     }, 750 + Math.random() * 500);
     return () => clearTimeout(t);
   }, [turn, phase]);
+
+  function downloadHistoryCSV() {
+    const header = "Hand,HoleCards,Board,Preflop,Flop,Turn,River,WentToShowdown,ShowdownHand,NetResult\n";
+    const rows = history.map((h) => [
+      h.hand,
+      h.holeCards.join(" "),
+      h.board.join(" "),
+      h.preflop.join("; "),
+      h.flop.join("; "),
+      h.turn.join("; "),
+      h.river.join("; "),
+      h.wentToShowdown ? "yes" : "no",
+      h.showdownHand || "",
+      h.net,
+    ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","));
+    const csv = header + rows.join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `poker-hand-history-${Date.now()}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  const sessionStats = (() => {
+    const n = history.length;
+    if (n === 0) return null;
+    const netTotal = history.reduce((s, h) => s + h.net, 0);
+    const vpipCount = history.filter((h) => h.vpip).length;
+    const showdownHands = history.filter((h) => h.wentToShowdown);
+    const wins = history.filter((h) => h.net > 0).length;
+    const showdownWins = showdownHands.filter((h) => h.net > 0).length;
+    const preflopRaises = history.filter((h) => h.preflop.some((a) => a.startsWith("raise"))).length;
+    const preflopFolds = history.filter((h) => h.preflop[0] === "fold" || h.preflop.every((a) => a === "fold")).length;
+    return {
+      n,
+      netTotal,
+      vpipPct: Math.round((vpipCount / n) * 100),
+      winPct: Math.round((wins / n) * 100),
+      showdownPct: Math.round((showdownHands.length / n) * 100),
+      showdownWinPct: showdownHands.length ? Math.round((showdownWins / showdownHands.length) * 100) : null,
+      raisePct: Math.round((preflopRaises / n) * 100),
+      foldPct: Math.round((preflopFolds / n) * 100),
+    };
+  })();
 
   const human = players[0];
   const humanTurn = phase !== "idle" && phase !== "handover" && turn === 0 && !human.folded && !human.allIn && !human.out;
@@ -531,7 +624,7 @@ export default function PokerPractice() {
               <span style={{ fontSize: 14 }}>{gameOver}</span>
               <button className="pk-btn pk-btn-primary" onClick={() => {
                 setPlayers(players.map((p) => ({ ...p, stack: STARTING_STACK, out: false, folded: false, allIn: false, hole: [], bet: 0 })));
-                setDealer(-1); setPhase("idle"); setGameOver(null); setShowdown(null); setLog(["New game. Press \"Deal hand\" to start."]);
+                setDealer(-1); setPhase("idle"); setGameOver(null); setShowdown(null); setLog(["New game. Press \"Deal hand\" to start."]); setHistory([]); handNumRef.current = 0;
               }}>Restart game</button>
             </div>
           )}
@@ -568,8 +661,35 @@ export default function PokerPractice() {
           {log.map((l, i) => <div key={i}>{l}</div>)}
           <div ref={logEndRef} />
         </div>
+
+        {history.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <button className="pk-btn" onClick={() => setShowStats((s) => !s)}>
+                {showStats ? "Hide session stats" : "Show session stats"}
+              </button>
+              <button className="pk-btn" onClick={downloadHistoryCSV}>
+                Download hand history ({history.length} hands)
+              </button>
+            </div>
+            {showStats && sessionStats && (
+              <div style={{
+                marginTop: 10, background: "rgba(0,0,0,0.25)", border: "1px solid var(--felt-felt-2)", borderRadius: 8,
+                padding: "10px 14px", fontSize: 13, fontFamily: "var(--felt-mono)", lineHeight: 1.8,
+              }}>
+                <div>Hands played: {sessionStats.n}</div>
+                <div>Net chips: {sessionStats.netTotal >= 0 ? "+" : ""}{sessionStats.netTotal}</div>
+                <div>Win rate: {sessionStats.winPct}%</div>
+                <div>VPIP (voluntarily played preflop): {sessionStats.vpipPct}%</div>
+                <div>Preflop raise rate: {sessionStats.raisePct}%</div>
+                <div>Preflop fold rate: {sessionStats.foldPct}%</div>
+                <div>Reached showdown: {sessionStats.showdownPct}%</div>
+                {sessionStats.showdownWinPct !== null && <div>Win rate at showdown: {sessionStats.showdownWinPct}%</div>}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 }
-
