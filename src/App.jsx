@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 const SUITS = ["s", "h", "d", "c"];
-const SUIT_SYMBOL = { s: "♠", h: "♥", d: "♦", c: "♣" };
+const SUIT_SYMBOL = { s: "\u2660", h: "\u2665", d: "\u2666", c: "\u2663" };
 const SUIT_RED = { s: false, h: true, d: true, c: false };
 const RANKS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 const RANK_LABEL = { 11: "J", 12: "Q", 13: "K", 14: "A" };
@@ -16,8 +16,8 @@ const RANK_PLURAL = {
 const rankLabel = (r) => RANK_LABEL[r] || String(r);
 const cardText = (c) => `${rankLabel(c.rank)}${c.suit}`;
 
-const SEAT_NAMES = ["You", "Ace", "Deuce", "Trey", "Four", "Five"];
-const STARTING_STACK = 1000;
+const SEAT_NAMES = ["You", "Ace", "Deuce", "Trey", "Chris", "Mike"];
+const STARTING_STACK = 1500;
 const SMALL_BLIND = 10;
 const BIG_BLIND = 20;
 
@@ -119,6 +119,64 @@ function computeEquity(myHole, oppHoles, board, trials) {
   }
   return sum / trials;
 }
+
+// Draw a plausible 2-card hand from the remaining deck whose Chen percentile falls within
+// [minPct, maxPct] — used to sample what an opponent's range plausibly contains, without ever
+// looking at their real cards. Falls back to any two cards if nothing in range is found quickly.
+function sampleRangeHand(pool, minPct, maxPct, maxAttempts = 25) {
+  for (let i = 0; i < maxAttempts && pool.length >= 2; i++) {
+    const i1 = Math.floor(Math.random() * pool.length);
+    let i2 = Math.floor(Math.random() * pool.length);
+    while (i2 === i1) i2 = Math.floor(Math.random() * pool.length);
+    const c1 = pool[i1], c2 = pool[i2];
+    const { percentile } = preflopPercentile([c1, c2]);
+    if (percentile >= minPct && percentile <= maxPct) return [c1, c2];
+  }
+  const i1 = Math.floor(Math.random() * pool.length);
+  let i2 = Math.floor(Math.random() * pool.length);
+  while (i2 === i1 && pool.length > 1) i2 = Math.floor(Math.random() * pool.length);
+  return [pool[i1], pool[i2]];
+}
+
+// The bot-facing equity function: unlike computeEquity, this NEVER sees a real opponent card.
+// Each opponent's hand is sampled fresh per trial from the range implied by their actions this
+// hand (see inferOpponentRange), drawing only from cards not already known or assigned —
+// which also means card removal (blockers) is automatically correct, for free.
+function computeEquityInferred(myHole, opponentRanges, board, trials) {
+  if (!opponentRanges.length) return 1;
+  if (trials === undefined) trials = Math.max(90, Math.round(600 / (opponentRanges.length + 1)));
+  const knownFixed = new Set([...myHole, ...board].map((c) => c.id));
+  const baseDeck = [];
+  for (const s of SUITS) for (const r of RANKS) { const id = `${r}${s}`; if (!knownFixed.has(id)) baseDeck.push({ rank: r, suit: s, id }); }
+  const need = 5 - board.length;
+  let sum = 0;
+  for (let t = 0; t < trials; t++) {
+    let pool = [...baseDeck];
+    const oppHands = [];
+    for (const range of opponentRanges) {
+      const hand = sampleRangeHand(pool, range.min, range.max);
+      oppHands.push(hand);
+      const usedIds = new Set(hand.map((c) => c.id));
+      pool = pool.filter((c) => !usedIds.has(c.id));
+    }
+    const drawn = [];
+    for (let k = 0; k < need; k++) {
+      const idx = Math.floor(Math.random() * pool.length);
+      drawn.push(pool[idx]);
+      pool.splice(idx, 1);
+    }
+    const fullBoard = [...board, ...drawn];
+    const myScore = bestHand([...myHole, ...fullBoard]).score;
+    const oppScores = oppHands.map((h) => bestHand([...h, ...fullBoard]).score);
+    let top = myScore;
+    for (const s of oppScores) if (compareScore(s, top) > 0) top = s;
+    if (compareScore(myScore, top) < 0) continue;
+    const tiedCount = 1 + oppScores.filter((s) => compareScore(s, top) === 0).length;
+    sum += 1 / tiedCount;
+  }
+  return sum / trials;
+}
+
 function handName(res) {
   const { category, tb } = res;
   switch (category) {
@@ -320,6 +378,9 @@ export default function App() {
   const handMetaRef = useRef({ holeCards: [], recorded: false, evNet: null, allInCaptured: false });
   const handDecisionsRef = useRef([]);
   const handOpponentActionsRef = useRef({});
+  const handActionsByIdxRef = useRef([]); // per-player action log this hand, used for range inference
+  const lastPreflopRaiserRef = useRef(-1); // used for continuation-bet logic
+  const handCommittedRef = useRef([]); // per-player: has this bot decided this hand is worth a big pot yet?
 
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [log]);
 
@@ -328,7 +389,7 @@ export default function App() {
   const activePlayers = (ps) => ps.filter((p) => !p.out && !p.folded);
 
   function resetForNewHand(ps) {
-    return ps.map((p) => ({ ...p, hole: [], folded: p.out, allIn: false, bet: 0, totalInvested: 0 }));
+    return ps.map((p) => ({ ...p, hole: [], folded: p.out, allIn: false, bet: 0, totalInvested: 0, handStartStack: p.stack }));
   }
 
   function startHand() {
@@ -347,6 +408,9 @@ export default function App() {
     handMetaRef.current = { holeCards: [], recorded: false, evNet: null, allInCaptured: false };
     handDecisionsRef.current = [];
     handOpponentActionsRef.current = {};
+    handActionsByIdxRef.current = ps.map(() => ({ preflop: [], flop: [], turn: [], river: [] }));
+    lastPreflopRaiserRef.current = -1;
+    handCommittedRef.current = ps.map(() => false);
     let d = dealer < 0 ? 0 : nextActiveIndex(ps, dealer);
     const sb = nextActiveIndex(ps, d);
     const bb = nextActiveIndex(ps, sb);
@@ -383,16 +447,27 @@ export default function App() {
   // Each layer is only won by players who contributed at least that layer's threshold —
   // this is what stops a short stack's all-in from winning chips it was never matched against.
   function computeSidePots(ps) {
-    const contributors = ps.map((p, i) => ({ i, amount: p.totalInvested || 0 })).filter((c) => c.amount > 0);
-    const levels = [...new Set(contributors.map((c) => c.amount))].sort((a, b) => a - b);
+    const contributors = ps.map((p, i) => ({ i, amount: p.totalInvested || 0, allIn: p.allIn })).filter((c) => c.amount > 0);
+    // Only players actually capped by running out of chips create a real side-pot boundary.
+    // A player who simply folded early with a smaller total isn't "all-in" — their smaller
+    // contribution shouldn't split the pot, it just goes into the same pot as everyone else's.
+    const allInLevels = [...new Set(contributors.filter((c) => c.allIn).map((c) => c.amount))].sort((a, b) => a - b);
     const pots = [];
     let prev = 0;
-    for (const level of levels) {
+    for (const level of allInLevels) {
       const layerContributors = contributors.filter((c) => c.amount >= level);
       const layerAmount = (level - prev) * layerContributors.length;
       const eligible = layerContributors.map((c) => c.i).filter((i) => !ps[i].folded);
       if (layerAmount > 0 && eligible.length > 0) pots.push({ amount: layerAmount, eligible });
       prev = level;
+    }
+    // Everything above the highest all-in level (or the entire pot, if nobody's all-in) forms
+    // one final pot — this is what collapses back to a single normal pot when there's no all-in.
+    const finalLayer = contributors.filter((c) => c.amount > prev);
+    if (finalLayer.length > 0) {
+      const finalAmount = finalLayer.reduce((s, c) => s + (c.amount - prev), 0);
+      const eligible = finalLayer.map((c) => c.i).filter((i) => !ps[i].folded);
+      if (finalAmount > 0 && eligible.length > 0) pots.push({ amount: finalAmount, eligible });
     }
     return pots;
   }
@@ -446,6 +521,13 @@ export default function App() {
       })
       .filter(Boolean)
       .join(" | ");
+    // Post-hand-only reveal, purely for auditing decisions after the fact — bots never see this
+    // themselves. Every seat's hole cards, regardless of fold status, so a hand like a big multi-way
+    // pot can actually be checked rather than guessed at.
+    const botHoleCards = ps
+      .map((p, i) => (i === 0 || p.out || !p.hole || p.hole.length < 2 ? null : `${p.name}: ${p.hole.map(cardText).join(" ")}`))
+      .filter(Boolean)
+      .join(" | ");
     setHistory((h) => [
       ...h,
       {
@@ -464,6 +546,7 @@ export default function App() {
         wasAllInAdjusted: handMetaRef.current.evNet !== null,
         decisionsScored: scoredDecisions.length,
         decisionsGood: goodDecisions,
+        botHoleCards,
         decisionLog: decisions.map((d) => `${d.street}:${d.action}(${Math.round(d.equity * 100)}%)=${d.verdict}`).join(" | "),
         opponentActions: oppSummary,
       },
@@ -554,6 +637,15 @@ export default function App() {
     let newPot = pot, newCurrentBet = currentBet, newMinRaise = minRaise;
     const need = new Set(needsToAct);
 
+    // Unified per-player action log (all players, all street), used for range inference.
+    if (handActionsByIdxRef.current[idx]) {
+      let genericDesc = action;
+      if (action === "call") genericDesc = `call ${Math.min(currentBet - p.bet, p.stack)}`;
+      else if (action === "raise") genericDesc = `raise to ${Math.min(amount, p.bet + p.stack)}`;
+      handActionsByIdxRef.current[idx][phase].push(genericDesc);
+    }
+    if (action === "raise" && phase === "preflop") lastPreflopRaiserRef.current = idx;
+
     if (idx === 0 && handActionsRef.current[phase]) {
       let desc = action;
       if (action === "call") desc = `call ${Math.min(currentBet - p.bet, p.stack)}`;
@@ -640,102 +732,308 @@ export default function App() {
   const applyActionRef = useRef(applyAction);
   applyActionRef.current = applyAction;
 
-  const TIER_LABEL = { veryEasy: "Very Easy", easy: "Easy", medium: "Medium", hard: "Hard", veryHard: "Very Hard" };
   const TIER_CONFIG = {
-    veryEasy: { fn: "passive", preflopCallPct: 15, preflopRaisePct: 92, overfoldMargin: 0.22, raiseThreshold: 0.85, sizing: 1.0 },
-    easy:     { fn: "passive", preflopCallPct: 30, preflopRaisePct: 85, overfoldMargin: 0.15, raiseThreshold: 0.75, sizing: 1.0 },
-    medium:   { fn: "medium" },
-    hard:     { fn: "mdf", mdfMultiplier: 0.6, bluffRaiseFreq: 0.18, valueThreshold: 0.62 },
-    veryHard: { fn: "mdf", mdfMultiplier: 0.85, bluffRaiseFreq: 0.28, valueThreshold: 0.55 },
+    veryEasy: { fn: "passive", preflopCallPct: 15, preflopRaisePct: 92, overfoldMargin: 0.22, raiseThreshold: 0.85, sizing: 1.0, riskTolerance: 0.15, cbetFreq: 0.35, perceptionNoise: 20 },
+    easy:     { fn: "passive", preflopCallPct: 30, preflopRaisePct: 85, overfoldMargin: 0.15, raiseThreshold: 0.75, sizing: 1.0, riskTolerance: 0.25, cbetFreq: 0.45, perceptionNoise: 15 },
+    medium:   { fn: "medium", riskTolerance: 0.45, cbetFreq: 0.5, perceptionNoise: 9 },
+    hard:     { fn: "mdf", mdfMultiplier: 0.6, bluffRaiseFreq: 0.18, valueThreshold: 0.62, riskTolerance: 0.65, cbetFreq: 0.6, perceptionNoise: 4 },
+    veryHard: { fn: "mdf", mdfMultiplier: 0.85, bluffRaiseFreq: 0.28, valueThreshold: 0.55, riskTolerance: 0.8, cbetFreq: 0.65, perceptionNoise: 2 },
   };
   const BOT_TIER = { 1: "veryEasy", 2: "easy", 3: "medium", 4: "hard", 5: "veryHard" };
 
+  // Real casual players reason off a rough sense of hand strength, not a precise percentage --
+  // and that sense is genuinely imprecise, sometimes over- sometimes under-estimating. This is the
+  // single point where that imprecision enters: everything downstream (pot odds, MDF, shove
+  // threshold, implied odds, the commitment gate) already reads from the same equity/percentile
+  // value, so noising it once here means every decision inherits it consistently, rather than
+  // needing five separate adjustments that could drift out of sync with each other.
+  function perceivedStrength(trueValuePct, noiseMagnitude) {
+    const bellish = (Math.random() + Math.random() + Math.random() - 1.5) / 1.5; // roughly -1..1, most error small
+    return Math.max(0, Math.min(100, trueValuePct + bellish * noiseMagnitude));
+  }
+
+  // Infers a plausible range for a live opponent from what they've actually done this hand —
+  // never their real cards. More/bigger raises implies a narrower, stronger range, the way a
+  // human reads betting patterns. No signal yet (checked only, or first to act) means "could be anything."
+  function inferOpponentRange(idx) {
+    const log = handActionsByIdxRef.current[idx];
+    if (!log) return { min: 0, max: 100 };
+    const all = [...log.preflop, ...log.flop, ...log.turn, ...log.river];
+    const raiseCount = all.filter((a) => a.startsWith("raise")).length;
+    const hasCalled = all.some((a) => a.startsWith("call"));
+    if (raiseCount >= 2) return { min: 85, max: 100 };
+    if (raiseCount === 1) return { min: 70, max: 100 };
+    if (hasCalled) return { min: 30, max: 100 };
+    return { min: 0, max: 100 };
+  }
+
+  function liveOpponentsInfo(idx) {
+    const info = [];
+    players.forEach((pl, i) => {
+      if (i !== idx && !pl.out && !pl.folded) info.push({ i, allIn: pl.allIn, range: inferOpponentRange(i) });
+    });
+    return info;
+  }
+
+  // Modeled on the real shape of push/fold charts: shove wider as the stack (in big blinds) gets
+  // shorter. riskTolerance (per tier) shifts the bar — a risk-averse tier needs a stronger hand
+  // to justify full commitment than an aggressive one at the same stack depth.
+  function shoveThresholdPercentile(bbDepth, riskTolerance) {
+    let base;
+    if (bbDepth <= 10) base = 62;
+    else if (bbDepth <= 20) base = 76;
+    else if (bbDepth <= 35) base = 86;
+    else base = 93;
+    const adjust = (0.5 - riskTolerance) * 20;
+    return Math.max(50, Math.min(98, base + adjust));
+  }
+
+  // A deliberately looser bar than the shove threshold above — this answers "is this hand worth
+  // playing for a real pot at all," not "is this hand strong enough to go all-in." Reusing the
+  // shove bar here was a real bug: it's a near-certainty threshold (87th-98th percentile), which
+  // meant almost nothing ever cleared it and bots defaulted to cheap-call-or-fold the entire hand.
+  function commitmentBarPercentile(riskTolerance) {
+    const base = 55;
+    const adjust = (0.5 - riskTolerance) * 20;
+    return Math.max(35, Math.min(75, base + adjust));
+  }
+
+  // Reverse implied odds: a made straight/flush on a board that could easily contain a bigger one
+  // needs extra margin before committing big. Implied odds: real equity backed by a low hand
+  // category (a live draw, not a made hand yet) gets a little slack, since a future street can pay
+  // off large. Deliberately not applied to the passive tiers — real recreational players are
+  // characteristically the ones who DON'T reason about this, so leaving it out there is more honest,
+  // not a shortcut.
+  function impliedOddsAdjustment(bot, requiredEquity, equity) {
+    if (community.length < 3) return requiredEquity;
+    const myCat = bestHand([...bot.hole, ...community]).category;
+    const suitCounts = {};
+    community.forEach((c) => { suitCounts[c.suit] = (suitCounts[c.suit] || 0) + 1; });
+    const flushy = Math.max(...Object.values(suitCounts)) >= 3;
+    const ranks = community.map((c) => c.rank);
+    const paired = new Set(ranks).size < ranks.length;
+    let adjusted = requiredEquity;
+    if ((myCat === 5 || myCat === 6) && (flushy || paired)) adjusted += 0.08; // reverse implied odds
+    if (myCat <= 2 && equity > requiredEquity * 0.75) adjusted -= 0.06; // implied odds slack for a live draw
+    return adjusted;
+  }
+
   function decidePassive(bot, idx, toCall, cfg) {
     // Documented amateur leaks: loose-passive preflop, overfolds postflop, rarely bluffs, flat sizing.
+    // No implied-odds reasoning on purpose — real recreational players characteristically don't do this.
+    const oppInfo = liveOpponentsInfo(idx);
+    const foldableOpp = oppInfo.filter((o) => !o.allIn);
+    const allInOnly = foldableOpp.length === 0 && oppInfo.length > 0;
+    const bbDepth = bot.stack / BIG_BLIND;
+    const potForSizing = pot || BIG_BLIND;
+
     if (community.length === 0) {
-      const { percentile } = preflopPercentile(bot.hole);
+      const { percentile: truePercentile } = preflopPercentile(bot.hole);
+      const percentile = perceivedStrength(truePercentile, cfg.perceptionNoise);
       if (toCall <= 0) return { action: "check" };
-      if (percentile >= cfg.preflopRaisePct) return { action: "raise", amount: Math.min(bot.bet + bot.stack, Math.round(currentBet * 2.5)) };
+      if (allInOnly) {
+        const requiredEquity = toCall / (pot + toCall);
+        return { action: percentile / 100 >= requiredEquity ? "call" : "fold" };
+      }
+      // Commit-once gate: the first time this bot faces real pressure, decide once — with the
+      // same bar used for shove-eligibility — whether this hand is worth playing for a big pot.
+      // Pass: commit for the rest of the hand and use normal logic below, unmodified. Fail: stay
+      // cautious — only cheap continuations, never a raise — instead of drifting deeper one
+      // individually-reasonable street at a time.
+      if (!handCommittedRef.current[idx]) {
+        const bar = commitmentBarPercentile(cfg.riskTolerance);
+        if (percentile >= bar) handCommittedRef.current[idx] = true;
+        else {
+          const cheap = toCall <= pot * 0.25;
+          const requiredEquity = toCall / (pot + toCall);
+          return { action: cheap && percentile / 100 >= requiredEquity ? "call" : "fold" };
+        }
+      }
+      if (percentile >= cfg.preflopRaisePct) {
+        const shoveEligible = percentile >= shoveThresholdPercentile(bbDepth, cfg.riskTolerance);
+        const amt = sizedRaiseAmount(bot, currentBet, potForSizing, cfg.sizing, shoveEligible);
+        return amt === null ? { action: "call" } : { action: "raise", amount: amt };
+      }
       if (percentile >= cfg.preflopCallPct) return { action: "call" }; // calls too wide preflop, a classic leak
       return { action: "fold" };
     }
-    const equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
+
+    const opponentRanges = oppInfo.map((o) => o.range);
+    const trueEquity = computeEquityInferred(bot.hole, opponentRanges, community);
+    const equity = perceivedStrength(trueEquity * 100, cfg.perceptionNoise) / 100;
+    if (allInOnly) {
+      if (toCall <= 0) return { action: "check" };
+      const requiredEquity = toCall / (pot + toCall);
+      return { action: equity >= requiredEquity ? "call" : "fold" };
+    }
+    const mwFactor = 1 / Math.sqrt(Math.max(1, foldableOpp.length));
     if (toCall <= 0) {
-      if (equity > cfg.raiseThreshold) return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, pot, cfg.sizing) }; // one-size-fits-all sizing tell
+      const isCbetSpot = lastPreflopRaiserRef.current === idx && community.length <= 3;
+      const cbet = isCbetSpot && Math.random() < cfg.cbetFreq * mwFactor;
+      if (equity > cfg.raiseThreshold || cbet) {
+        const shoveEligible = equity * 100 >= shoveThresholdPercentile(bbDepth, cfg.riskTolerance);
+        const amt = sizedRaiseAmount(bot, currentBet, potForSizing, cfg.sizing, shoveEligible); // one-size-fits-all sizing tell
+        if (amt !== null) { handCommittedRef.current[idx] = true; return { action: "raise", amount: amt }; }
+      }
       return { action: "check" };
+    }
+    if (!handCommittedRef.current[idx]) {
+      const bar = commitmentBarPercentile(cfg.riskTolerance);
+      if (equity * 100 >= bar) handCommittedRef.current[idx] = true;
+      else {
+        const cheap = toCall <= pot * 0.25;
+        const requiredEquity = toCall / (pot + toCall);
+        return { action: cheap && equity >= requiredEquity ? "call" : "fold" };
+      }
     }
     const requiredEquity = toCall / (pot + toCall);
     // Overfolds relative to what's actually required — the "scared of aggression" leak.
     if (equity < requiredEquity + cfg.overfoldMargin) return { action: "fold" };
-    if (equity > cfg.raiseThreshold && bot.stack > toCall) return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, pot, cfg.sizing) };
+    if (equity > cfg.raiseThreshold && bot.stack > toCall) {
+      const shoveEligible = equity * 100 >= shoveThresholdPercentile(bbDepth, cfg.riskTolerance);
+      const amt = sizedRaiseAmount(bot, currentBet, potForSizing, cfg.sizing, shoveEligible);
+      return amt === null ? { action: "call" } : { action: "raise", amount: amt };
+    }
     return { action: "call" };
   }
 
   function decideMedium(bot, idx, toCall) {
-    // Sound, standard, unexploitative — but not sophisticated. Real equity, conventional sizing.
-    let equity;
-    if (community.length === 0) equity = preflopPercentile(bot.hole).percentile / 100;
-    else equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
+    // Sound, standard, unexploitative — but not sophisticated. Real (inferred) equity, conventional
+    // sizing. Deliberately skips the fuller shove-theory machinery the harder tiers use — that's
+    // what "not sophisticated" means here.
+    const cfg = TIER_CONFIG.medium;
+    const oppInfo = liveOpponentsInfo(idx);
+    const foldableOpp = oppInfo.filter((o) => !o.allIn);
+    const allInOnly = foldableOpp.length === 0 && oppInfo.length > 0;
+    const opponentRanges = oppInfo.map((o) => o.range);
+    let trueEquity;
+    if (community.length === 0) trueEquity = preflopPercentile(bot.hole).percentile / 100;
+    else trueEquity = computeEquityInferred(bot.hole, opponentRanges, community);
+    const equity = perceivedStrength(trueEquity * 100, cfg.perceptionNoise) / 100;
+    if (allInOnly) {
+      if (toCall <= 0) return { action: "check" };
+      const requiredEquity = toCall / (pot + toCall);
+      return { action: equity >= requiredEquity ? "call" : "fold" };
+    }
     const bluff = Math.random() < 0.07;
     const noise = Math.random() * 0.1 - 0.05;
     const strength = Math.min(1, equity + (bluff ? 0.3 : 0) + noise);
     const potForSizing = pot || BIG_BLIND;
+    const bbDepth = bot.stack / BIG_BLIND;
     if (toCall <= 0) {
-      if (strength > 0.6) return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, potForSizing, 0.6) };
+      if (strength > 0.6) {
+        const shoveEligible = strength * 100 >= shoveThresholdPercentile(bbDepth, cfg.riskTolerance);
+        const amt = sizedRaiseAmount(bot, currentBet, potForSizing, 0.6, shoveEligible);
+        if (amt !== null) { handCommittedRef.current[idx] = true; return { action: "raise", amount: amt }; }
+      }
       return { action: "check" };
+    }
+    if (!handCommittedRef.current[idx]) {
+      const bar = commitmentBarPercentile(cfg.riskTolerance);
+      if (strength * 100 >= bar) handCommittedRef.current[idx] = true;
+      else {
+        const cheap = toCall <= pot * 0.25;
+        const requiredEquity = toCall / (pot + toCall);
+        return { action: cheap && strength >= requiredEquity ? "call" : "fold" };
+      }
     }
     const requiredEquity = toCall / (pot + toCall);
     if (strength < requiredEquity && strength < 0.4) return { action: "fold" };
-    if (strength > 0.65 && bot.stack > toCall) return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, potForSizing, 0.65) };
+    if (strength > 0.65 && bot.stack > toCall) {
+      const shoveEligible = strength * 100 >= shoveThresholdPercentile(bbDepth, cfg.riskTolerance);
+      const amt = sizedRaiseAmount(bot, currentBet, potForSizing, 0.65, shoveEligible);
+      return amt === null ? { action: "call" } : { action: "raise", amount: amt };
+    }
     return { action: "call" };
   }
 
   function decideMDF(bot, idx, toCall, cfg) {
-    // Grounded in Minimum Defense Frequency: continues at least as often as MDF requires,
-    // so it can't be profitably exploited by pure bluffs. Balances value raises with bluff-raises.
-    let equity;
-    if (community.length === 0) equity = preflopPercentile(bot.hole).percentile / 100;
-    else equity = computeEquity(bot.hole, opponentHolesFor(idx), community);
+    // Grounded in Minimum Defense Frequency: continues at least as often as MDF requires, scaled
+    // down as more live opponents can also share that job. Balances value raises with bluff-raises
+    // and continuation bets, all drawn from the same sizing distribution so bet size alone can't be read.
+    const oppInfo = liveOpponentsInfo(idx);
+    const foldableOpp = oppInfo.filter((o) => !o.allIn);
+    const allInOnly = foldableOpp.length === 0 && oppInfo.length > 0;
+    const opponentRanges = oppInfo.map((o) => o.range);
+    let trueEquity;
+    if (community.length === 0) trueEquity = preflopPercentile(bot.hole).percentile / 100;
+    else trueEquity = computeEquityInferred(bot.hole, opponentRanges, community);
+    const equity = perceivedStrength(trueEquity * 100, cfg.perceptionNoise) / 100;
     const potForSizing = pot || BIG_BLIND;
+    const bbDepth = bot.stack / BIG_BLIND;
+
+    // Path B: everyone still live is already all-in. No fold equity exists for that bet — pure
+    // equity check, no bluffing, no raising for pressure that can't do anything.
+    if (allInOnly) {
+      if (toCall <= 0) return { action: "check" };
+      const requiredEquity = toCall / (pot + toCall);
+      return { action: equity >= requiredEquity ? "call" : "fold" };
+    }
+
+    // Path A: at least one live opponent can still fold — fold equity is real.
+    const mwFactor = 1 / Math.sqrt(Math.max(1, foldableOpp.length));
     if (toCall <= 0) {
-      const bluffRaise = Math.random() < cfg.bluffRaiseFreq; // balanced range: some bluff-raises even when unstrong
-      if (equity > cfg.valueThreshold || bluffRaise) {
-        const sizePct = 0.33 + Math.random() * 0.5; // varied sizing, harder to read
-        return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, potForSizing, sizePct) };
+      const isCbetSpot = phase !== "preflop" && lastPreflopRaiserRef.current === idx && community.length <= 3;
+      const cbet = isCbetSpot && Math.random() < cfg.cbetFreq * mwFactor;
+      const bluffRaise = Math.random() < cfg.bluffRaiseFreq * mwFactor;
+      if (equity > cfg.valueThreshold || bluffRaise || cbet) {
+        const myPct = equity * 100; // equity already carries the perception noise, preflop or postflop alike
+        const shoveEligible = myPct >= shoveThresholdPercentile(bbDepth, cfg.riskTolerance);
+        const sizePct = 0.33 + Math.random() * 0.52; // same distribution for value and bluffs — unreadable by size
+        const amt = sizedRaiseAmount(bot, currentBet, potForSizing, sizePct, shoveEligible);
+        if (amt !== null) { handCommittedRef.current[idx] = true; return { action: "raise", amount: amt }; }
       }
       return { action: "check" };
     }
+
+    if (!handCommittedRef.current[idx]) {
+      const myPct = equity * 100; // equity already carries the perception noise, preflop or postflop alike
+      const bar = commitmentBarPercentile(cfg.riskTolerance);
+      if (myPct >= bar) handCommittedRef.current[idx] = true;
+      else {
+        const cheap = toCall <= pot * 0.25;
+        const requiredEquity = toCall / (pot + toCall);
+        return { action: cheap && equity >= requiredEquity ? "call" : "fold" };
+      }
+    }
+
     const requiredEquity = toCall / (pot + toCall);
-    const mdf = pot / (pot + toCall); // fraction of holdings that should continue, in theory
-    if (equity >= requiredEquity) {
+    const adjustedRequired = impliedOddsAdjustment(bot, requiredEquity, equity);
+    if (equity >= adjustedRequired) {
       const valueRaise = equity > cfg.valueThreshold + 0.06 && bot.stack > toCall;
       if (valueRaise) {
-        const sizePct = 0.4 + Math.random() * 0.5;
-        return { action: "raise", amount: sizedRaiseAmount(bot, currentBet, potForSizing, sizePct) };
+        const shoveEligible = equity * 100 >= shoveThresholdPercentile(bbDepth, cfg.riskTolerance);
+        const sizePct = 0.33 + Math.random() * 0.52;
+        const amt = sizedRaiseAmount(bot, currentBet, potForSizing, sizePct, shoveEligible);
+        return amt === null ? { action: "call" } : { action: "raise", amount: amt };
       }
       return { action: "call" };
     }
-    // Below breakeven equity, but within bluff-catch range: continue at roughly the MDF-implied rate
-    // rather than folding outright, so a human can't profitably bluff this bot into submission.
-    const bluffCatchZone = equity > requiredEquity - 0.18;
+    // Below breakeven equity, but within bluff-catch range: continue at roughly the (multiway-scaled)
+    // MDF-implied rate rather than folding outright, so a human can't profitably bluff this bot into submission.
+    const mdf = (pot / (pot + toCall)) * mwFactor;
+    const bluffCatchZone = equity > adjustedRequired - 0.18;
     if (bluffCatchZone && Math.random() < mdf * cfg.mdfMultiplier) return { action: "call" };
     return { action: "fold" };
   }
 
-  // Stack-to-pot ratio (SPR) aware sizing: a pot-relative raise that ignores remaining stack
-  // will naturally snowball into an accidental all-in as the pot grows street over street.
-  // When the stack is already short relative to the pot, the sound move is to shove or back off,
-  // not to keep making medium raises that drift to full commitment without ever deciding to.
-  function sizedRaiseAmount(bot, currentBetNow, potNow, sizePct) {
+  // Caps total commitment for the WHOLE HAND against the stack the bot started the hand with —
+  // not against whatever's left at each individual raise. The earlier per-raise-only cap let
+  // several legitimate-looking raises compound to ~98% of a stack without ever "shoving" (a
+  // measured, real bug: three 75%-capped raises in sequence reach 98.4% of the original stack).
+  // Returns null when there's no room left for a real raise under the cap — callers fall back
+  // to calling instead, rather than forcing an invalid or degenerate raise size.
+  function sizedRaiseAmount(bot, currentBetNow, potNow, sizePct, shoveEligible) {
     const spr = bot.stack / Math.max(potNow, 1);
-    if (spr < 1) return bot.bet + bot.stack; // short enough that a partial raise doesn't make sense — shove
+    if (spr < 1 && shoveEligible) return bot.bet + bot.stack; // genuine shove — bypasses the hand budget entirely
     const raw = currentBetNow + Math.max(minRaise, Math.round(potNow * sizePct));
-    const cap = bot.bet + Math.round(bot.stack * 0.75); // never commit more than 75% of remaining stack in one raise
-    return Math.min(bot.bet + bot.stack, raw, Math.max(cap, currentBetNow + minRaise));
-  }
-
-  function opponentHolesFor(idx) {
-    return players.filter((pl, i) => i !== idx && !pl.out && !pl.folded).map((pl) => pl.hole);
+    const handStart = bot.handStartStack || bot.stack + (bot.totalInvested || 0);
+    const handBudget = Math.round(handStart * 0.75); // total committable this hand, absent a genuine shove
+    const budgetRemaining = handBudget - (bot.totalInvested || 0);
+    const minLegalTarget = currentBetNow + minRaise;
+    if (budgetRemaining <= 0 || bot.bet + budgetRemaining < minLegalTarget) return null;
+    const budgetCap = bot.bet + budgetRemaining;
+    return Math.min(bot.bet + bot.stack, raw, budgetCap);
   }
 
   function botDecide(bot, idx) {
@@ -760,7 +1058,7 @@ export default function App() {
   }, [turn, phase]);
 
   function downloadHistoryCSV() {
-    const header = "Hand,HoleCards,Board,Preflop,Flop,Turn,River,OpponentActions,WentToShowdown,ShowdownHand,NetResult,EVNetResult,AllInAdjusted,DecisionsScored,DecisionsGood,DecisionLog\n";
+    const header = "Hand,HoleCards,Board,Preflop,Flop,Turn,River,OpponentActions,BotHoleCards,WentToShowdown,ShowdownHand,NetResult,EVNetResult,AllInAdjusted,DecisionsScored,DecisionsGood,DecisionLog\n";
     const rows = history.map((h) => [
       h.hand,
       h.holeCards.join(" "),
@@ -770,6 +1068,7 @@ export default function App() {
       h.turn.join("; "),
       h.river.join("; "),
       h.opponentActions || "",
+      h.botHoleCards || "",
       h.wentToShowdown ? "yes" : "no",
       h.showdownHand || "",
       h.net,
@@ -918,7 +1217,7 @@ export default function App() {
                       ))}
                     </div>
                     <div style={{ fontSize: 13, fontWeight: 500, color: p.out ? "var(--felt-brass)" : "var(--felt-cream)" }}>
-                      {p.name}{BOT_TIER[i] ? ` (${TIER_LABEL[BOT_TIER[i]]})` : ""}{isDealer ? " (D)" : ""}{p.out ? " — out" : p.folded ? " — folded" : ""}
+                      {p.name}{isDealer ? " (D)" : ""}{p.out ? " — out" : p.folded ? " — folded" : ""}
                     </div>
                     <div style={{ fontFamily: "var(--felt-mono)", fontSize: 12, color: "var(--felt-brass)" }}>{p.stack}</div>
                     {p.bet > 0 && <div style={{ marginTop: 4 }}><Chip amount={p.bet} /></div>}
@@ -1041,3 +1340,4 @@ export default function App() {
     </div>
   );
 }
+
